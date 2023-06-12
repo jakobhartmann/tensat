@@ -1,9 +1,10 @@
+#![allow(unused_variables)]
+#![allow(unused_must_use)]
+
 use clap::{App, Arg};
 use egg::*;
-use std::collections::{HashMap, HashSet};
-use std::env::*;
+use std::collections::{HashMap};
 use std::fs::*;
-use std::time::*;
 use std::time::{Duration, Instant};
 use tensat::bert;
 use tensat::model::*;
@@ -19,13 +20,11 @@ use tensat::vgg;
 use tensat::squeezenet;
 use tensat::{parse::*, verify::*};
 
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use std::fs::OpenOptions;
 use std::io::prelude::*;
-use std::io::Error;
-use std::process::{Command, Stdio};
-use std::thread;
+use std::process::{Command};
+use std::path::Path;
 
 use std::ffi::CString;
 
@@ -55,18 +54,21 @@ fn main() {
                 .help("Provide a file with rewrite rules"),
         )
         .arg(
+            Arg::with_name("gj")
+                .long("gj"),
+        )
+        .arg(
             Arg::with_name("out_file")
-                .short("o")
+                // .short("o")
                 .long("out_file")
                 .takes_value(true)
                 .help("Provide a output file name. For mode convert, it's for converted rules; for mode optimize, it's for measured runtime"),
         )
         .arg(
-            Arg::with_name("export_model")
+            Arg::with_name("export_models")
                 .short("x")
-                .long("export_model")
-                .takes_value(true)
-                .help("Provide a file name to store optimized model"),
+                .long("export_models")
+                .help("Whether or not to store input and optimized model"),
         )
         .arg(
             Arg::with_name("model_file")
@@ -191,6 +193,13 @@ fn main() {
                 .long("saturation_only")
                 .help("Run saturation only"),
         )
+        .arg(
+            Arg::with_name("output_dir")
+                .long("output_dir")
+                .short("out_dir")
+                .takes_value(true)
+                .help("Output directory to save all experimental results to"),
+        )
         .get_matches();
 
     let run_mode = matches.value_of("mode").unwrap();
@@ -237,6 +246,34 @@ fn optimize(matches: clap::ArgMatches) {
     let use_multi = matches.is_present("use_multi");
     let no_cycle = matches.is_present("no_cycle");
     let filter_after = !matches.is_present("filter_before");
+    let output_directory = matches.value_of("output_dir").unwrap();
+
+    // Warn if output directory already exists, otherwise create it
+    if Path::new(output_directory).exists() {
+        println!("You are overwriting existing data!");
+    } else {
+        create_dir_all(output_directory);
+    }
+
+    // Save settings
+    let mut settings = Map::new();
+    for arg in &matches.args {
+        let key = arg.0.to_string();
+        let value = if !arg.1.vals.is_empty() {
+            Value::String(arg.1.vals[0].clone().into_string().unwrap())
+        } else {
+            Value::String(String::from("true"))
+        };
+        settings.insert(key, value);
+    }
+
+    let filename = Path::new(output_directory).join("settings.txt");
+    let mut file = OpenOptions::new().append(true).create(true).open(filename).unwrap();
+    let settings_data = serde_json::to_string(&settings).expect("Failed to convert json to string");
+
+    if let Err(e) = writeln!(file, "{}", settings_data) {
+        eprintln!("Couldn't write to file: {}", e);
+    }
 
     // Get input graph and rules
     // learned_rules are the learned rules from TASO, pre_defined_rules are the hand-specified rules from TASO
@@ -291,13 +328,13 @@ fn optimize(matches: clap::ArgMatches) {
             .map(|x| (x, /*symmetric=*/ true))
             .chain(pre_defined_multi)
             .collect();
-        MultiPatterns::with_rules(multi_rules, no_cycle, iter_multi, filter_after, node_multi, n_sec)
+        MultiPatterns::with_rules(multi_rules, no_cycle, iter_multi, filter_after, node_multi, n_sec, String::from(output_directory))
     } else {
         let multi_rules: Vec<(&str, bool)> = PRE_DEFINED_MULTI
             .iter()
             .map(|&x| (x, /*symmetric=*/ false))
             .collect();
-        MultiPatterns::with_rules(multi_rules, no_cycle, iter_multi, filter_after, node_multi, n_sec)
+        MultiPatterns::with_rules(multi_rules, no_cycle, iter_multi, filter_after, node_multi, n_sec, String::from(output_directory))
     };
 
     // Run saturation
@@ -321,7 +358,7 @@ fn optimize(matches: clap::ArgMatches) {
             .with_time_limit(time_limit_sec)
             .with_iter_limit(iter_limit)
             .with_expr(&start)
-            .with_hook(move |runner| multi_patterns.run_one(runner))
+            .with_hook(move |runner| multi_patterns.run_one(runner, None))
     } else {
         Runner::<Mdl, TensorAnalysis, ()>::default()
             .with_node_limit(node_limit)
@@ -330,8 +367,15 @@ fn optimize(matches: clap::ArgMatches) {
             .with_expr(&start)
     };
 
+    // if matches.is_present("gj") {
+    //     runner.egraph.strategy = egg::Strategy::GenericJoin;
+    // } else {
+    //     runner.egraph.strategy = egg::Strategy::EMatch;
+    // }
+
     let start_time = Instant::now();
     let mut runner = runner.run(&rules[..]);
+
     if do_filter_after {
         // Do cycle removal after the final iteration
         remove_cycle_by_order(&mut runner);
@@ -342,7 +386,7 @@ fn optimize(matches: clap::ArgMatches) {
     println!("Runner complete!");
     println!("  Nodes: {}", runner.egraph.total_size());
     println!("  Classes: {}", runner.egraph.number_of_classes());
-    println!("  Stopped: {:?}", runner.stop_reason.unwrap());
+    println!("  Stopped: {:?}", runner.stop_reason.as_ref().unwrap());
     println!("  Time taken: {:?}", sat_duration);
     println!("  Number of iterations: {:?}", num_iter_sat);
 
@@ -352,31 +396,44 @@ fn optimize(matches: clap::ArgMatches) {
     println!("  Number of edges: {}", num_edges);
     println!("  Number of programs: {}", num_programs);
 
+    // Save iteration data
+    let filename = Path::new(output_directory).join("iteration_data.txt");
+    let mut file = OpenOptions::new().append(true).create(true).open(filename).unwrap();
+    let iteration_data = serde_json::to_string(&runner.iterations).expect("Failed to convert IterationData json to string");
+    if let Err(e) = writeln!(file, "{}", iteration_data) {
+        eprintln!("Couldn't write to file: {}", e);
+    }
+
     // Save egraph
     let (egraph, root) = (runner.egraph, runner.roots[0]);
     if save_graph == "all" {
-        egraph.dot().to_svg("target/tensat.svg").unwrap();
+        let filename = Path::new(output_directory).join("tensat.svg");
+        egraph.dot().to_svg(filename).unwrap();
     }
 
     if matches.is_present("saturation_only") {
         if let Some(outf) = matches.value_of("out_file") {
+            let filename = Path::new(output_directory).join(outf);
             let mut file = OpenOptions::new()
                 .append(true)
                 .create(true)
-                .open(outf)
+                .open(filename)
                 .unwrap();
 
             // Stats to write: original runtime, optimized runtime, saturation time, extraction time,
             // number of nodes, number of eclasses, number of possible programs
             let data = json!({
-                "original": 0.0,
-                "optimized": 0.0,
-                "saturation": sat_duration.as_secs_f32(),
-                "extraction": 0.0,
-                "nodes": num_enodes,
-                "classes": num_classes,
-                "programs": num_programs,
-                "iter": num_iter_sat,
+                "runner_stop_reason": runner.stop_reason.as_ref().unwrap(),
+                "runner_time": sat_duration.as_secs_f32(),
+                "num_iterations": num_iter_sat,
+                "num_enodes": num_enodes,
+                "num_classes": num_classes,
+                "avg_nodes_per_class": avg_nodes_per_class,
+                "num_edges": num_edges,
+                "num_programs": num_programs,
+                "extraction_time": 0.0,
+                "original_runtime": 0.0,
+                "optimized_runtime": 0.0,
             });
             let sol_data_str = serde_json::to_string(&data).expect("Fail to convert json to string");
 
@@ -390,22 +447,40 @@ fn optimize(matches: clap::ArgMatches) {
         let cost_model = CostModel::with_setting(
             /*ignore_all_weight_only=*/ matches.is_present("all_weight_only"),
         );
-        let (best, ext_secs) = match extract_mode {
+        let (best, best_cost, ext_secs) = match extract_mode {
             "ilp" => extract_by_ilp(&egraph, root, &matches, &cost_model),
-            "greedy" => {
-                let tnsr_cost = TensorCost {
-                    egraph: &egraph,
-                    cost_model: &cost_model,
-                };
+            "egg_ilp" => {
+                let tnsr_cost = TensorCost::new(
+                    &egraph,
+                    &cost_model,
+                    true,
+                );
+
                 let start_time = Instant::now();
-                let mut extractor = Extractor::new(&egraph, tnsr_cost);
+                let mut lp_extractor = LpExtractor::new(&egraph, tnsr_cost);
+                let (best_cost, best) = lp_extractor.solve(root);
+                let duration = start_time.elapsed();
+
+                println!("Egg's ILP Extractor complete!");
+                println!("  Time taken: {:?}", duration);
+                println!("  Best cost: {:?}", best_cost);
+                (best, best_cost as f32, duration.as_secs_f32())
+            }
+            "greedy" => {
+                let tnsr_cost = TensorCost::new(
+                    &egraph,
+                    &cost_model,
+                    true,
+                );
+                let start_time = Instant::now();
+                let extractor = Extractor::new(&egraph, tnsr_cost);
                 let (best_cost, best) = extractor.find_best(root);
                 let duration = start_time.elapsed();
 
                 println!("Extractor complete!");
                 println!("  Time taken: {:?}", duration);
                 println!("  Best cost: {:?}", best_cost);
-                (best, duration.as_secs_f32())
+                (best, best_cost, duration.as_secs_f32())
             }
             _ => panic!("Extracting mode not supported"),
         };
@@ -415,12 +490,11 @@ fn optimize(matches: clap::ArgMatches) {
         let runner_ext = Runner::<Mdl, TensorAnalysis, ()>::default().with_expr(&best);
 
         if save_graph != "none" {
-            runner_start
-                .egraph
-                .dot()
-                .to_svg("target/start.svg")
-                .unwrap();
-            runner_ext.egraph.dot().to_svg("target/ext.svg").unwrap();
+            let start_filename = Path::new(output_directory).join("start.svg");
+            runner_start.egraph.dot().to_svg(start_filename).unwrap();
+
+            let ext_filename = Path::new(output_directory).join("ext.svg");
+            runner_ext.egraph.dot().to_svg(ext_filename).unwrap();
         }
 
         let time_start = get_full_graph_runtime(&runner_start, false);
@@ -429,32 +503,36 @@ fn optimize(matches: clap::ArgMatches) {
         let time_ext = get_full_graph_runtime(&runner_ext, true);
         println!("Extracted graph runtime: {}", time_ext);
 
-        if let Some(exportf) = matches.value_of("export_model") {
-            save_model(&runner_start, &(exportf.to_owned()+"_start.model"));
-        }
+        if matches.is_present("export_models") {
+            let filename_start = Path::new(output_directory).join("start.model");
+            save_model(&runner_start, filename_start.to_str().unwrap());
 
-        if let Some(exportf) = matches.value_of("export_model") {
-            save_model(&runner_ext, &(exportf.to_owned()+"_optimized.model"));
+            let filename_optimized = Path::new(output_directory).join("optimized.model");
+            save_model(&runner_ext, filename_optimized.to_str().unwrap());
         }
 
         if let Some(outf) = matches.value_of("out_file") {
+            let filename = Path::new(output_directory).join(outf);
             let mut file = OpenOptions::new()
                 .append(true)
                 .create(true)
-                .open(outf)
+                .open(filename)
                 .unwrap();
 
             // Stats to write: original runtime, optimized runtime, saturation time, extraction time,
             // number of nodes, number of eclasses, number of possible programs
             let data = json!({
-                "original": time_start,
-                "optimized": time_ext,
-                "saturation": sat_duration.as_secs_f32(),
-                "extraction": ext_secs,
-                "nodes": num_enodes,
-                "classes": num_classes,
-                "programs": num_programs,
-                "iter": num_iter_sat,
+                "runner_stop_reason": runner.stop_reason.as_ref().unwrap(),
+                "runner_time": sat_duration.as_secs_f32(),
+                "num_iterations": num_iter_sat,
+                "num_enodes": num_enodes,
+                "num_classes": num_classes,
+                "avg_nodes_per_class": avg_nodes_per_class,
+                "num_edges": num_edges,
+                "num_programs": num_programs,
+                "extraction_time": ext_secs,
+                "original_runtime": time_start,
+                "optimized_runtime": time_ext,
             });
             let sol_data_str = serde_json::to_string(&data).expect("Fail to convert json to string");
 
@@ -475,7 +553,9 @@ fn extract_by_ilp(
     root: Id,
     matches: &clap::ArgMatches,
     cost_model: &CostModel,
-) -> (RecExpr<Mdl>, f32) {
+) -> (RecExpr<Mdl>, f32, f32) {
+    let binding = std::thread::current();
+    let thread_name = binding.name().unwrap();
     // Prepare data for ILP formulation, save to json
     let (m_id_map, e_m, h_i, cost_i, g_i, root_m, i_to_nodes, blacklist_i) =
         prep_ilp_data(egraph, root, cost_model);
@@ -489,8 +569,10 @@ fn extract_by_ilp(
         "blacklist_i": blacklist_i,
     });
     let data_str = serde_json::to_string(&data).expect("Fail to convert json to string");
-    create_dir_all("./tmp");
-    write("./tmp/ilp_data.json", data_str).expect("Unable to write file");
+
+    let output_directory = matches.value_of("output_dir").unwrap();
+    let filename = Path::new(output_directory).join("ilp_data_".to_owned() + thread_name + ".json");
+    write(filename, data_str).expect("Unable to write file");
 
     let initialize = matches.is_present("initial_with_greedy");
     if initialize {
@@ -501,21 +583,22 @@ fn extract_by_ilp(
             .map(|(i, node)| (node.clone(), i))
             .collect();
 
-        let tnsr_cost = TensorCost {
-            egraph: egraph,
-            cost_model: cost_model,
-        };
-        let mut extractor = Extractor::new(egraph, tnsr_cost);
-        let (i_list, m_list) = get_init_solution(egraph, root, &extractor.costs, &g_i, &node_to_i);
+        let tnsr_cost = TensorCost::new(
+            egraph,
+            cost_model,
+            true,
+        );
+        let extractor = Extractor::new(egraph, tnsr_cost);
+        let (i_list, m_list) = get_init_solution(egraph, root, &extractor, &g_i, &node_to_i);
 
         // Store initial solution
         let solution_data = json!({
             "i_list": i_list,
             "m_list": m_list,
         });
-        let sol_data_str =
-            serde_json::to_string(&solution_data).expect("Fail to convert json to string");
-        write("./tmp/init_sol.json", sol_data_str).expect("Unable to write file");
+        let sol_data_str = serde_json::to_string(&solution_data).expect("Fail to convert json to string");
+        let filename = Path::new(output_directory).join("init_sol_".to_owned() + thread_name + ".json");
+        write(filename, sol_data_str).expect("Unable to write file");
     }
 
     // Call python script to run ILP
@@ -543,6 +626,12 @@ fn extract_by_ilp(
         arg_vec.push("--num_thread");
         arg_vec.push(num_thread);
     }
+    if let Some(output_dir) = matches.value_of("output_dir") {
+        arg_vec.push("--output_dir");
+        arg_vec.push(output_dir);
+    }
+    arg_vec.push("--thread_name");
+    arg_vec.push(thread_name);
     let child = Command::new("python")
         .args(&arg_vec)
         .spawn()
@@ -551,10 +640,9 @@ fn extract_by_ilp(
 
     if output.status.success() {
         // Read back solved results, construct optimized graph
-        let solved_str = read_to_string("./tmp/solved.json")
-            .expect("Something went wrong reading the solved file");
-        let solved_data: SolvedResults =
-            serde_json::from_str(&solved_str).expect("JSON was not well-formatted");
+        let filename = Path::new(output_directory).join("solved_".to_owned() + thread_name + ".json");
+        let solved_str = read_to_string(filename).expect("Something went wrong reading the solved file");
+        let solved_data: SolvedResults = serde_json::from_str(&solved_str).expect("JSON was not well-formatted");
 
         let mut node_picked: HashMap<Id, Mdl> = HashMap::new();
         for (i, x_i) in solved_data.solved_x.iter().enumerate() {
@@ -562,8 +650,8 @@ fn extract_by_ilp(
                 let eclass_id = m_id_map[g_i[i]];
                 if node_picked.contains_key(&eclass_id) {
                     println!("Duplicate node in eclass");
-                    println!("{}", node_picked.get(&eclass_id).unwrap().display_op());
-                    println!("{}", i_to_nodes[i].display_op());
+                    println!("{}", node_picked.get(&eclass_id).unwrap());
+                    println!("{}", i_to_nodes[i]);
                     continue;
                 }
                 //assert!(!node_picked.contains_key(&eclass_id));
@@ -574,7 +662,7 @@ fn extract_by_ilp(
         let mut expr = RecExpr::default();
         let mut added_memo: HashMap<Id, Id> = Default::default();
         let _ = construct_best_rec(&node_picked, root, &mut added_memo, egraph, &mut expr);
-        (expr, solved_data.time)
+        (expr, solved_data.time, solved_data.time)
     } else {
         panic!("Python script failed");
     }
@@ -606,7 +694,8 @@ fn get_stats(egraph: &EGraph<Mdl, TensorAnalysis>) -> (usize, usize, f32, usize,
 }
 
 fn get_full_graph_runtime(runner: &Runner<Mdl, TensorAnalysis, ()>, process: bool) -> f32 {
-    let mut g = runner.egraph.analysis.graph.borrow_mut();
+    // let mut g = runner.egraph.analysis.graph.borrow_mut();
+    let mut g = runner.egraph.analysis.graph.lock().unwrap();
     unsafe {
         // This is calling TASO's preprocess_weights function before evaluating full graph
         // run time. It removes op that has only weights as its inputs. Since TASO only cares
@@ -623,7 +712,8 @@ fn get_full_graph_runtime(runner: &Runner<Mdl, TensorAnalysis, ()>, process: boo
 }
 
 fn save_model(runner: &Runner<Mdl, TensorAnalysis, ()>, file_name: &str) {
-    let mut g = runner.egraph.analysis.graph.borrow_mut();
+    // let mut g = runner.egraph.analysis.graph.borrow_mut();
+    let mut g = runner.egraph.analysis.graph.lock().unwrap();
     unsafe {
         (*g).export_to_file_raw(CString::new(file_name).unwrap().into_raw());
     }

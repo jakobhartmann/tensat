@@ -1,15 +1,19 @@
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
+#![allow(unconditional_recursion)]
+#![allow(unused_parens)]
+#![allow(unused_variables)]
 
-include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+// include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+include!(concat!("/usr/tensat/taso_bindings.rs"));
 
 //use rand::prelude::*;
 use rand;
 use root::taso::*;
 use std::collections::HashSet;
 use std::convert::TryInto;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
 
 use egg::*;
 
@@ -104,14 +108,19 @@ impl Default for ValTnsr {
     }
 }
 
+unsafe impl Send for ValTnsr {}
+unsafe impl Sync for ValTnsr {}
+
 /// Struct for metadata analysis
 ///
 /// In this analysis, it calls functions on the TASO side (e.g. graph.matmul())
 /// to create (or get) new ops/nodes and stores pointers to the output tensors.
 /// TASO will measure and store the runtime cost when creating a new op/node.
+#[derive(Clone)]
 pub struct TensorAnalysis {
     /// Points to the graph object on the TASO side
-    pub graph: std::cell::RefCell<Box<Graph>>,
+    // pub graph: std::cell::RefCell<Box<Graph>>,
+    pub graph: Arc<Mutex<Box<Graph>>>,
     /// Record blacklisted nodes for filtering cycles
     pub blacklist_nodes: HashSet<Mdl>,
     /// Newly added nodes by order
@@ -126,7 +135,8 @@ impl Default for TensorAnalysis {
             let mut graph = Box::new(Graph::new());
             Graph_Graph(&mut *graph);
             TensorAnalysis {
-                graph: std::cell::RefCell::new(graph),
+                // graph: std::cell::RefCell::new(graph),
+                graph: Arc::new(Mutex::new(graph)),
                 blacklist_nodes: HashSet::<Mdl>::new(),
                 newly_added: Vec::<Mdl>::new(),
             }
@@ -138,13 +148,29 @@ impl Analysis<Mdl> for TensorAnalysis {
     type Data = ValTnsr;
 
     /// Merges two metadata when two eclasses are merged.
-    fn merge(&self, to: &mut Self::Data, from: Self::Data) -> bool {
+    fn merge(&mut self, to: &mut Self::Data, from: Self::Data) -> DidMerge {
+        let a0 = to.all_weights.clone();
+        let b = from.all_weights.clone();
+
         if from.all_weights && (!to.all_weights) {
             to.all_weights = from.all_weights;
+        }
+        
+        let a1 = to.all_weights.clone();
+
+        let a_merged = if a0 != a1 {
             true
         } else {
             false
-        }
+        };
+
+        let b_merged = if b != a1 {
+            true
+        } else {
+            false
+        };
+        
+        DidMerge(a_merged, b_merged)
     }
 
     // Constructs metadata for a new enode, using TASO side functions for tensors.
@@ -160,7 +186,8 @@ impl Analysis<Mdl> for TensorAnalysis {
             dims
         };
 
-        let mut g = egraph.analysis.graph.borrow_mut();
+        // let mut g = egraph.analysis.graph.borrow_mut();
+        let mut g = egraph.analysis.graph.lock().unwrap();
         match enode {
             Mdl::Matmul([act, a, b]) => {
                 // Check types

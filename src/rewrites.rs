@@ -1,10 +1,16 @@
+#![allow(unused_variables)]
+#![allow(dead_code)]
+
 use crate::model::*;
 use egg::{rewrite as rw, *};
 use itertools::Itertools;
 use root::taso::*;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
-use std::time::{Duration, Instant};
+use std::time::{Instant};
+use std::path::Path;
+use std::fs::OpenOptions;
+use std::io::Write;
 
 // TODO egg now provides bidirectional rules whic should cut down
 // this list in half.
@@ -169,14 +175,14 @@ impl PartialEq for Op {
 /// Custom struct implementing the Applier trait, checking the new nodes to
 /// construct are all valid before actually apply.
 #[derive(Debug, Clone, PartialEq)]
-struct CheckApply {
+pub struct CheckApply {
     /// the pattern of the right hand side of the rewrite rule, the one
     /// to be constructed.
-    pat: Pattern<Mdl>,
+    pub pat: Pattern<Mdl>,
     /// Source graph pattern, used in cycle filtering
-    src_pat: Pattern<Mdl>,
+    pub src_pat: Pattern<Mdl>,
     /// Whether we need to check if any node in matched source graph is in blacklist
-    filter_after: bool,
+    pub filter_after: bool,
 }
 
 impl Applier<Mdl, TensorAnalysis> for CheckApply {
@@ -187,6 +193,8 @@ impl Applier<Mdl, TensorAnalysis> for CheckApply {
         egraph: &mut EGraph<Mdl, TensorAnalysis>,
         matched_id: Id,
         subst: &Subst,
+        searcher_ast: Option<&PatternAst<Mdl>>,
+        rule_name: Symbol,
     ) -> Vec<Id> {
         if self.filter_after {
             // Check if any node in matched source graph is in blacklist. If so, stop applying
@@ -202,7 +210,7 @@ impl Applier<Mdl, TensorAnalysis> for CheckApply {
             /*get_exist_nodes=*/ self.filter_after,
         );
         if valid {
-            let result = self.pat.apply_one(egraph, matched_id, subst);
+            let result = self.pat.apply_one(egraph, matched_id, subst, searcher_ast, rule_name);
 
             // Add the newly added nodes to the ordering vector
             if self.filter_after {
@@ -418,7 +426,8 @@ fn check_pat(
                     }
                 }
                 // root node not in egraph, compute metadata
-                let mut g = egraph.analysis.graph.borrow_mut();
+                // let mut g = egraph.analysis.graph.borrow_mut();
+                let mut g = egraph.analysis.graph.lock().unwrap();
                 let result = match e {
                     Mdl::Num(_n) => {
                         let t_data = TData {
@@ -836,7 +845,7 @@ fn check_pat(
 }
 
 /// Struct for storing information on how each pattern maps to its canonical version
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct MapToCanonical {
     /// Index into MultiPatterns.canonical_src_pat. Points to the canonical version.
     index: usize,
@@ -846,10 +855,10 @@ struct MapToCanonical {
 
 /// Struct for the multi-pattern rules. In charge of searching for matches and
 /// applying the rewrite.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MultiPatterns {
     /// Vec of (src_1, src_2, dst_1, dst_2, symmetric)
-    rules: Vec<(Pattern<Mdl>, Pattern<Mdl>, Pattern<Mdl>, Pattern<Mdl>, bool)>,
+    pub rules: Vec<(Pattern<Mdl>, Pattern<Mdl>, Pattern<Mdl>, Pattern<Mdl>, bool)>,
     /// Vec of all unique canonical source patterns (for src_1's and src_2's)
     canonical_src_pat: Vec<Pattern<Mdl>>,
     /// Mapping information for each src pattern. The order is the same as in rules
@@ -868,6 +877,8 @@ pub struct MultiPatterns {
     num_applied: usize,
     /// Descendents map. Only used if filter_after is true
     descendents: Option<HashMap<Id, HashSet<Id>>>,
+    /// Output directory. If non empty, will be used to save the number of multi-pattern rewrite rule applications. If empty, no effect.
+    output_dir: String,
 }
 
 impl MultiPatterns {
@@ -882,6 +893,7 @@ impl MultiPatterns {
     ///         else, do naive filtering (check cycle before each application)
     /// - `node_limit`: Maximum number of nodes to added here
     /// - `n_sec`: Maximum number of seconds to run
+    /// - `output_dir`: Output directory to save the number of multi-pattern rewrite rule applications to.
     pub fn with_rules(
         rules: Vec<(&str, bool)>,
         no_cycle: bool,
@@ -889,6 +901,7 @@ impl MultiPatterns {
         filter_after: bool,
         node_limit: usize,
         n_sec: u64,
+        output_dir: String,
     ) -> MultiPatterns {
         assert!(rules.len() % 2 == 0);
 
@@ -947,6 +960,7 @@ impl MultiPatterns {
             node_limit: node_limit,
             num_applied: 0,
             n_sec: n_sec,
+            output_dir: output_dir,
         }
     }
 
@@ -956,20 +970,23 @@ impl MultiPatterns {
     /// of all canonicalized source patterns. Then for all compatible substitutions found,
     /// it checks and applies the dst patterns. It won't apply if src_1 and src_2 matches with
     /// the same eclass. It always returns Ok()
-    pub fn run_one(&mut self, runner: &mut Runner<Mdl, TensorAnalysis, ()>) -> Result<(), String> {
+    pub fn run_one(&mut self, runner: &mut Runner<Mdl, TensorAnalysis, ()>, rule_idx: Option<usize>) -> Result<(), String> {
+        // Keep track how often each multi-pattern rewrite rule was applied in this iteration
+        let mut rules_applied = HashMap::new();
+
         if self.filter_after {
             // This is to remove cycles introduced during the last iteration of single rules
             remove_cycle_by_order(runner);
         }
 
         if runner.iterations.len() < self.iter_limit && self.node_limit > 0 && self.n_sec > 0 {
-            println!("Run one");
+            // println!("Run one");
             let starting_num_nodes = runner.egraph.analysis.newly_added.len();
             let start_time = Instant::now();
-            let mut num_applied = 0;
+            let num_applied = 0;
 
             // Construct Vec to store matches for each canonicalized pattern
-            let matches: Vec<Vec<SearchMatches>> = self
+            let matches: Vec<Vec<SearchMatches<Mdl>>> = self
                 .canonical_src_pat
                 .iter()
                 .map(|x| x.search(&runner.egraph))
@@ -986,6 +1003,18 @@ impl MultiPatterns {
 
             // For each multi rule
             'outer: for (i, rule) in self.rules.iter().enumerate() {
+                let current_rule = i;
+                // If a rule idx is supplied, skip all rules except the specified one (used by EgraphEnv -> step())
+                match rule_idx {
+                    Some(idx) => {
+                        if i != idx {
+                            continue;
+                        }
+                    }
+                    None => {}
+                }
+                // println!("Executed rule {}.", i);
+
                 let map_1 = &self.src_pat_maps[i].0;
                 let map_2 = &self.src_pat_maps[i].1;
                 // If the rule is fully symmetrical
@@ -998,11 +1027,14 @@ impl MultiPatterns {
                                 continue;
                             }
                             let n_applied = self.apply_match_pair(rule, match_1, match_2, map_1, map_2, runner);
+
+                            *rules_applied.entry(current_rule).or_insert(n_applied) += n_applied;
+
                             //num_applied += n_applied;
-                            //let num_nodes = runner.egraph.analysis.newly_added.len();
-                            //if num_nodes - starting_num_nodes > self.node_limit {
-                            //    break 'outer;
-                            //}
+                            let num_nodes = runner.egraph.analysis.newly_added.len();
+                            if num_nodes - starting_num_nodes > self.node_limit {
+                               break 'outer;
+                            }
                             if start_time.elapsed().as_secs() > self.n_sec {
                                 break 'outer;
                             }
@@ -1018,11 +1050,14 @@ impl MultiPatterns {
                                 continue;
                             }
                             let n_applied = self.apply_match_pair(rule, match_1, match_2, map_1, map_2, runner);
+
+                            *rules_applied.entry(current_rule).or_insert(n_applied) += n_applied;
+
                             //num_applied += n_applied;
-                            //let num_nodes = runner.egraph.analysis.newly_added.len();
-                            //if num_nodes - starting_num_nodes > self.node_limit {
-                            //    break 'outer;
-                            //}
+                            let num_nodes = runner.egraph.analysis.newly_added.len();
+                            if num_nodes - starting_num_nodes > self.node_limit {
+                               break 'outer;
+                            }
                             if start_time.elapsed().as_secs() > self.n_sec {
                                 break 'outer;
                             }
@@ -1037,7 +1072,7 @@ impl MultiPatterns {
                 // This is to remove cycles introduced during this run_one
                 remove_cycle_by_order(runner);
             }
-            println!("Done one");
+            // println!("Done one");
 
             let ending_num_nodes = runner.egraph.analysis.newly_added.len();
             self.node_limit = if ending_num_nodes - starting_num_nodes > self.node_limit {
@@ -1045,7 +1080,7 @@ impl MultiPatterns {
             } else {
                 self.node_limit - (ending_num_nodes - starting_num_nodes)
             };
-            println!("Number of nodes added: {}", ending_num_nodes - starting_num_nodes);
+            // println!("Number of nodes added: {}", ending_num_nodes - starting_num_nodes);
 
             let time_taken = start_time.elapsed().as_secs();
             self.n_sec = if time_taken > self.n_sec {
@@ -1056,6 +1091,14 @@ impl MultiPatterns {
 
             //println!("Number of applied: {}", num_applied);
         }
+        if self.output_dir != "" {
+            let filename = Path::new(&self.output_dir).join("hook_iteration_data.txt");
+            let mut file = OpenOptions::new().append(true).create(true).open(filename).unwrap();
+            let hook_iteration_data = serde_json::to_string(&rules_applied).expect("Failed to convert json to string");
+            if let Err(e) = writeln!(file, "{}", hook_iteration_data) {
+                eprintln!("Couldn't write to file: {}", e);
+            }
+        }
 
         Ok(())
     }
@@ -1065,8 +1108,8 @@ impl MultiPatterns {
     fn apply_match_pair(
         &self,
         rule: &(Pattern<Mdl>, Pattern<Mdl>, Pattern<Mdl>, Pattern<Mdl>, bool),
-        match_1: &SearchMatches,
-        match_2: &SearchMatches,
+        match_1: &SearchMatches<Mdl>,
+        match_2: &SearchMatches<Mdl>,
         map_1: &MapToCanonical,
         map_2: &MapToCanonical,
         runner: &mut Runner<Mdl, TensorAnalysis, ()>,
@@ -1142,19 +1185,22 @@ impl MultiPatterns {
                         };
                         if cycle_check_passed {
                             // apply dst patterns, union
-                            let id_1 =
-                                rule.2
-                                    .apply_one(&mut runner.egraph, match_1.eclass, &merged_subst)
-                                    [0];
+                            let id_1 = rule.2.apply_one(&mut runner.egraph, match_1.eclass, &merged_subst, None, "".into());
+                            let id_2 = rule.3.apply_one(&mut runner.egraph, match_2.eclass, &merged_subst, None, "".into());
 
-                            let id_2 =
-                                rule.3
-                                    .apply_one(&mut runner.egraph, match_2.eclass, &merged_subst)
-                                    [0];
+                            // If apply_one returns empty tensor, skip this rule pair, else increase applied counter
+                            if id_1 == [] || id_2 == [] {
+                                continue
+                            } else {
+                                num_applied += 0
+                            }
+
+                            let id_1 = id_1[0];
+                            let id_2 = id_2[0];
 
                             // Add the newly added nodes to the ordering list
                             if self.filter_after {
-                                //let n_before = runner.egraph.analysis.newly_added.len();
+                                let n_before = runner.egraph.analysis.newly_added.len();
 
                                 let existing_1 = existing_1.unwrap();
                                 let existing_2 = existing_2.unwrap();
@@ -1176,10 +1222,10 @@ impl MultiPatterns {
                                     &existing_2_updated,
                                 );
 
-                                /*let n_after = runner.egraph.analysis.newly_added.len();
+                                let n_after = runner.egraph.analysis.newly_added.len();
                                 if n_after > n_before {
                                     num_applied += 1;
-                                }*/
+                                }
                             }
 
                             runner.egraph.union(id_1, match_1.eclass);
@@ -1224,8 +1270,18 @@ impl MultiPatterns {
         // Check descendents of the input eclasses
         return input_ids.iter().all(|id| {
             let descendents = self.descendents.as_ref().unwrap();
-            let descendents_input = descendents.get(id).unwrap();
-            !descendents_input.contains(&out_class_1) && !descendents_input.contains(&out_class_2)
+            // Id is not always found!
+            // let descendents_input = descendents.get(id).unwrap();
+            // !descendents_input.contains(&out_class_1) && !descendents_input.contains(&out_class_2)
+            match descendents.get(id) {
+                Some(descendents_input) => {
+                    !descendents_input.contains(&out_class_1) && !descendents_input.contains(&out_class_2)
+                }
+                None => {
+                    // If the id is not found, the rule should not introduce a cycle -> correct?!
+                    true
+                }
+            }
         });
     }
 }

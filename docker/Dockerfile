@@ -56,6 +56,14 @@ RUN cd /usr && wget https://www2.graphviz.org/Packages/stable/portable_source/gr
 # install or-tools
 RUN python -m pip install -U ortools
 
+# Nvidia GPG key rotation
+RUN rm /etc/apt/sources.list.d/cuda.list
+RUN rm /etc/apt/sources.list.d/nvidia-ml.list
+
+RUN mkdir /usr/rmcts
+
+RUN mkdir /usr/experiments
+
 # vim
 RUN apt update
 RUN apt install -y vim

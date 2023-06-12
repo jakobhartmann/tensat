@@ -1,5 +1,6 @@
 from __future__ import print_function
 from ortools.linear_solver import pywraplp
+import os
 import json
 import argparse
 
@@ -19,7 +20,13 @@ def get_args():
     parser.add_argument('--print_solution', action='store_true', default=False,
         help='To print out solution')
     parser.add_argument('--initialize', action='store_true', default=False,
-        help='initialize with greedy solution')
+        help='Initialize with greedy solution')
+    parser.add_argument('--output_dir', type=str, required=True,
+        help='Output directory')
+    parser.add_argument('--thread_name', type=str, required=False, default='main',
+        help='Name of thread calling the extractor')
+    parser.add_argument('--verbose', action='store_true', default=False,
+        help='Allow print statements')
 
     return parser.parse_args()
 
@@ -28,12 +35,15 @@ def main():
     # Parse arguments
     args = get_args()
 
+    if args.verbose:
+        print("extract.py: Started!")
+
     # Load ILP data
     # - costs: cost for each node
     # - e: e[m] is the set of nodes within eclass m
     # - h: h[i] is the set of children eclasses for node i
     # - g: g(i) gives the eclass of node i
-    with open('./tmp/ilp_data.json') as f:
+    with open(os.path.join(args.output_dir, 'ilp_data_' + args.thread_name + '.json')) as f:
         data = json.load(f)
 
     costs = data['cost_i']
@@ -54,11 +64,13 @@ def main():
     # Create solver
     solver = pywraplp.Solver('simple_mip_program', pywraplp.Solver.SCIP_MIXED_INTEGER_PROGRAMMING)
     if args.num_thread != 1:
-        print("Set number of threads to {}".format(args.num_thread))
+        if args.verbose:
+            print("Set number of threads to {}".format(args.num_thread))
         solver.SetNumThreads(args.num_thread)
         
     if args.time_lim_sec > 0:
-        print("Set time limit to {} seconds".format(args.time_lim_sec))
+        if args.verbose:
+            print("Set time limit to {} seconds".format(args.time_lim_sec))
         solver.SetTimeLimit(args.time_lim_sec * 1000)
 
     # Define variables
@@ -71,14 +83,16 @@ def main():
 
     t = {}
     if args.order_var_int:
-        print("Use int var for order")
+        if args.verbose:
+            print("Use int var for order")
         for j in range(num_classes):
             t[j] = solver.IntVar(0, num_classes-1, 't[%i]' % j)
     else:
         for j in range(num_classes):
             t[j] = solver.NumVar(0.0, 1.0, 't[%i]' % j)
 
-    print('Number of variables =', solver.NumVariables())
+    if args.verbose:
+        print('Number of variables =', solver.NumVariables())
 
     # Define constraints
     # Root
@@ -88,7 +102,8 @@ def main():
         # eclass_constraints are optional because in most cases, the solution that minimizes
         # the total cost will only contain 1 picked node for each picked eclass, so we don't 
         # have to explicity include this.
-        print("Add eclass constraints")
+        if args.verbose:
+            print("Add eclass constraints")
         for m in range(num_classes):
             solver.Add(sum([x[j] for j in e[m]]) <= 1)
     
@@ -116,8 +131,9 @@ def main():
 
     # Set initial solutions
     if args.initialize:
-        print("Initialize with greedy")
-        with open('./tmp/init_sol.json') as f:
+        if args.verbose:
+            print("Initialize with greedy")
+        with open(os.path.join(args.output_dir, 'init_sol_' + args.thread_name + '.json')) as f:
             sol_data = json.load(f)
 
         i_list = sol_data['i_list']
@@ -145,25 +161,26 @@ def main():
     # Solve
     status = solver.Solve()
     solve_time = solver.wall_time()
-    if status == pywraplp.Solver.OPTIMAL:
-        print('Objective value =', solver.Objective().Value())
-        print('Problem solved in %f milliseconds' % solve_time)
-        print('Problem solved in %d iterations' % solver.iterations())
-        print('Problem solved in %d branch-and-bound nodes' % solver.nodes())
+    if args.verbose:
+        if status == pywraplp.Solver.OPTIMAL:
+            print('Objective value =', solver.Objective().Value())
+            print('Problem solved in %f milliseconds' % solve_time)
+            print('Problem solved in %d iterations' % solver.iterations())
+            print('Problem solved in %d branch-and-bound nodes' % solver.nodes())
 
-        if args.print_solution:
-            for j in range(num_nodes):
-                print(x[j].name(), ' = ', x[j].solution_value())
-            for j in range(num_classes):
-                print(t[j].name(), ' = ', t[j].solution_value())
-                
-    else:
-        print('The problem does not have an optimal solution.')
-        print(status)
-        print('Objective value =', solver.Objective().Value())
-        print('Problem solved in %f milliseconds' % solve_time)
-        print('Problem solved in %d iterations' % solver.iterations())
-        print('Problem solved in %d branch-and-bound nodes' % solver.nodes())
+            if args.print_solution:
+                for j in range(num_nodes):
+                    print(x[j].name(), ' = ', x[j].solution_value())
+                for j in range(num_classes):
+                    print(t[j].name(), ' = ', t[j].solution_value())
+                    
+        else:
+            print('The problem does not have an optimal solution.')
+            print(status)
+            print('Objective value =', solver.Objective().Value())
+            print('Problem solved in %f milliseconds' % solve_time)
+            print('Problem solved in %d iterations' % solver.iterations())
+            print('Problem solved in %d branch-and-bound nodes' % solver.nodes())
 
     # Store results
     solved_x = [int(x[j].solution_value()) for j in range(num_nodes)]
@@ -171,7 +188,7 @@ def main():
     result_dict["solved_x"] = solved_x
     result_dict["cost"] = solver.Objective().Value()
     result_dict["time"] = solve_time / 1000
-    with open('./tmp/solved.json', 'w') as f:
+    with open(os.path.join(args.output_dir, 'solved_' + args.thread_name + '.json'), 'w') as f:
         json.dump(result_dict, f)
 
 

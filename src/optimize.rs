@@ -1,25 +1,113 @@
-use crate::{model::*, rewrites::*};
+#![allow(unused_variables)]
+
+use crate::{model::*};
 use egg::*;
 use root::taso::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::convert::TryInto;
-use std::time::{Duration, Instant};
 
 /// Wrapper class for egg's cost function
+#[derive(Clone)]
 pub struct TensorCost<'a> {
     pub egraph: &'a EGraph<Mdl, TensorAnalysis>,
     pub cost_model: &'a CostModel,
+    // Fixed greedy
+    pub use_default_greedy: bool,
+    pub eclass_hashmap: HashMap<Id, HashMap<Id, f32>>,
+    pub curr_eclass: Option<Id>,
+    pub curr_eclass_best_cost: f32,
+    pub curr_eclass_best_enode_history: HashMap<Id, f32>,
+}
+
+impl<'a> TensorCost<'a> {
+    pub fn new(egraph: &'a EGraph<Mdl, TensorAnalysis>, cost_model: &'a CostModel, use_default_greedy: bool) -> Self {
+        TensorCost {
+            egraph: egraph, 
+            cost_model: cost_model,
+            // Fixed greedy
+            use_default_greedy: use_default_greedy,
+            eclass_hashmap: HashMap::new(),
+            curr_eclass: None,
+            curr_eclass_best_cost: std::f32::MAX,
+            curr_eclass_best_enode_history: HashMap::new(),
+        }
+    }
 }
 
 impl CostFunction<Mdl> for TensorCost<'_> {
     type Cost = f32;
     /// Getting total cost for the subtree rooted at enode. See egg::CostFunction
     /// trait for more information on interface.
-    fn cost<C: FnMut(Id) -> Self::Cost>(&mut self, enode: &Mdl, mut costs: C) -> Self::Cost {
+    fn cost<C: FnMut(Id) -> Self::Cost>(&mut self, enode: &Mdl, mut costs: C, eclass_id: Option<Id>) -> Self::Cost {
         let self_cost = self.cost_model.get_self_cost(self.egraph, enode);
-        enode.fold(self_cost, |sum, id| sum + costs(id))
+        if self.use_default_greedy {
+            enode.fold(self_cost, |sum, id| sum + costs(id))
+        } else {
+            if self.curr_eclass != eclass_id {
+                if self.curr_eclass_best_enode_history.len() > 0 {
+                    self.eclass_hashmap.insert(self.curr_eclass.unwrap(), self.curr_eclass_best_enode_history.clone());
+                }
+                self.curr_eclass = eclass_id;
+                self.curr_eclass_best_cost = std::f32::MAX;
+            }
+
+            let mut enode_history = HashMap::new();
+
+            let cost = enode.fold(self_cost, |sum, id| {
+                let eclass_cost = if enode_history.len() == 0 {
+                    match self.eclass_hashmap.get(&id) {
+                        Some(current_eclass_hashmap) => {
+                            enode_history = current_eclass_hashmap.clone();
+                        }
+                        None => {}
+                    }
+                    costs(id)
+                } else {
+                    if enode_history.contains_key(&id) {
+                        0.0
+                    } else {
+                        match self.eclass_hashmap.get(&id) {
+                            Some(current_eclass_hashmap) => {
+                                let mut highest_value = 0.0;
+                                for (key, value) in current_eclass_hashmap {
+                                    if enode_history.contains_key(key) {
+                                        if *value > highest_value {
+                                            highest_value = *value
+                                        }
+                                    } else {
+                                        enode_history.insert(*key, *value);
+                                    }
+                                }
+                                
+                                // costs(id) - highest_value
+                                f32::max(costs(id) - highest_value, 0.0)
+                            }
+                            None => {
+                                costs(id)
+                            }
+                        }
+                    }
+                };
+                if eclass_cost > 0.0 {  
+                    enode_history.insert(id, eclass_cost);
+                }
+                sum + eclass_cost
+            });
+
+            if cost < self.curr_eclass_best_cost {
+                self.curr_eclass_best_enode_history = enode_history; // .clone();
+                self.curr_eclass_best_cost = cost;
+            }
+            cost
+        }
+    }
+}
+
+impl LpCostFunction<Mdl, TensorAnalysis> for TensorCost<'_> {
+    fn node_cost(&mut self, egraph: &EGraph<Mdl, TensorAnalysis>, eclass: Id, enode: &Mdl) -> f64 {
+        self.cost_model.get_self_cost(self.egraph, enode) as f64
     }
 }
 
@@ -56,7 +144,8 @@ impl CostModel {
     /// Cost for this enode.
     pub fn get_self_cost(&self, egraph: &EGraph<Mdl, TensorAnalysis>, enode: &Mdl) -> f32 {
         let x = |i: &Id| &egraph[*i].data;
-        let mut g = egraph.analysis.graph.borrow_mut();
+        // let mut g = egraph.analysis.graph.borrow_mut();
+        let mut g = egraph.analysis.graph.lock().unwrap();
         match enode {
             Mdl::Num(_)
             | Mdl::Var(_)
@@ -735,7 +824,9 @@ pub fn construct_best_rec(
     let id = egraph.find(eclass);
 
     match added_memo.get(&id) {
-        Some(id_expr) => *id_expr,
+        Some(id_expr) => {
+            *id_expr
+        }
         None => {
             let node = node_picked.get(&id).unwrap().clone().map_children(|child| {
                 construct_best_rec(node_picked, child, added_memo, egraph, expr)
@@ -746,6 +837,54 @@ pub fn construct_best_rec(
         }
     }
 }
+
+// pub fn construct_best_rec_iteratively(
+//     node_picked: &HashMap<Id, Mdl>,
+//     eclass: Id,
+//     added_memo: &mut HashMap<Id, Id>,
+//     egraph: &EGraph<Mdl, TensorAnalysis>,
+//     expr: &mut RecExpr<Mdl>,
+// ) {
+//     let mut visited = HashSet::new();
+//     let mut eclass_stack = vec![(eclass, vec![])];
+
+//     while !eclass_stack.is_empty() {
+//         let (eclass, mut history) = eclass_stack.pop().unwrap();
+//         let id = egraph.find(eclass);
+
+//         match added_memo.get(&id) {
+//             Some(_) => {}
+//             None => {
+//                 if node_picked.get(&id).unwrap().clone().is_leaf() {
+//                     let node = node_picked[&id].clone();
+//                     let id_expr = expr.add(node);
+//                     assert!(added_memo.insert(id, id_expr).is_none());
+
+//                     while !history.clone().is_empty() {
+//                         let parent: Id = history.pop().unwrap();
+//                         if node_picked.get(&parent).unwrap().all(|child| added_memo.contains_key(&child)) {
+//                             let node = node_picked.get(&parent).unwrap().clone().map_children(|child| {
+//                                 *added_memo.get(&child).unwrap()
+//                             });
+//                             let id_expr = expr.add(node);
+//                             assert!(added_memo.insert(parent, id_expr).is_none());
+//                         };
+//                     };
+//                 }
+//             }
+//         };
+
+//         if !visited.contains(&id) {
+//             visited.insert(id);
+
+//             history.push(id.clone());
+//             for child in node_picked.get(&id).unwrap().children().into_iter().rev() {
+//                 eclass_stack.push((*child, history.clone()));
+//             };
+//             history.pop();
+//         }
+//     }
+// }
 
 /// Get the initial solution for ILP using the greedy extraction
 ///
@@ -770,7 +909,8 @@ pub fn construct_best_rec(
 pub fn get_init_solution(
     egraph: &EGraph<Mdl, TensorAnalysis>,
     root: Id,
-    costs: &HashMap<Id, (f32, Mdl)>,
+    // costs: &HashMap<Id, (f32, Mdl)>,
+    costs: &Extractor<TensorCost, Mdl, TensorAnalysis>,
     g_i: &[usize],
     nodes_to_i: &HashMap<Mdl, usize>,
 ) -> (Vec<usize>, Vec<usize>) {
@@ -802,16 +942,18 @@ fn get_init_rec(
     egraph: &EGraph<Mdl, TensorAnalysis>,
     eclass: Id,
     added_memo: &mut HashSet<Id>,
-    costs: &HashMap<Id, (f32, Mdl)>,
+    // costs: &HashMap<Id, (f32, Mdl)>,
+    costs: &Extractor<TensorCost, Mdl, TensorAnalysis>,
     nodes: &mut Vec<Mdl>,
 ) {
     let id = egraph.find(eclass);
 
     if !added_memo.contains(&id) {
-        let (_, best_node) = match costs.get(&id) {
-            Some(result) => result.clone(),
-            None => panic!("Failed to extract from eclass {}", id),
-        };
+        // let (_, best_node) = match costs.get(&id) {
+        //     Some(result) => result.clone(),
+        //     None => panic!("Failed to extract from eclass {}", id),
+        // };
+        let best_node = costs.find_best_node(id).clone();
         best_node.for_each(|child| get_init_rec(egraph, child, added_memo, costs, nodes));
         nodes.push(best_node);
         added_memo.insert(id);
