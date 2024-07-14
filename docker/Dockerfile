@@ -1,6 +1,6 @@
 # TASO parts
 
-FROM nvidia/cuda:10.0-devel-ubuntu16.04
+FROM nvidia/cuda:12.5.0-devel-ubuntu22.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends wget sudo binutils git && \
     rm -rf /var/lib/apt/lists/*
@@ -51,14 +51,14 @@ RUN mkdir /usr/tensat
 
 RUN mkdir /usr/TASO
 
-RUN cd /usr && wget https://www2.graphviz.org/Packages/stable/portable_source/graphviz-2.44.0.tar.gz && tar -xvf graphviz-2.44.0.tar.gz && cd graphviz-2.44.0 && ./configure && make && make install
+RUN cd /usr && wget https://gitlab.com/api/v4/projects/4207231/packages/generic/graphviz-releases/12.0.0/graphviz-12.0.0.tar.gz && tar -xvf graphviz-12.0.0.tar.gz && cd graphviz-12.0.0 && ./configure && make && make install
 
 # install or-tools
 RUN python -m pip install -U ortools
 
 # Nvidia GPG key rotation
-RUN rm /etc/apt/sources.list.d/cuda.list
-RUN rm /etc/apt/sources.list.d/nvidia-ml.list
+# RUN rm /etc/apt/sources.list.d/cuda.list
+# RUN rm /etc/apt/sources.list.d/nvidia-ml.list
 
 RUN mkdir /usr/rmcts
 

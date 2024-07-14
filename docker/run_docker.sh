@@ -1,9 +1,9 @@
 docker run --gpus all --pid=host --net=host \
---name tensat \
+--name tensat_eps_mcts \
 -it \
---mount type=bind,source="/home/jh2422/thesis/tensat",target=/usr/tensat \
---mount type=bind,source="/home/jh2422/thesis/egg",target=/usr/egg \
---mount type=bind,source="/home/jh2422/thesis/taso",target=/usr/TASO \
---mount type=bind,source="/home/jh2422/thesis/rmcts",target=/usr/rmcts \
---mount type=bind,source="/home/jh2422/thesis/experiments",target=/usr/experiments \
+--mount type=bind,source="/home/user/tensor-eqs-mcts/tensat",target=/usr/tensat \
+--mount type=bind,source="/home/user/tensor-eqs-mcts/egg",target=/usr/egg \
+--mount type=bind,source="/home/user/tensor-eqs-mcts/taso",target=/usr/TASO \
+--mount type=bind,source="/home/user/tensor-eqs-mcts/rmcts",target=/usr/rmcts \
+--mount type=bind,source="/home/user/tensor-eqs-mcts/experiments",target=/usr/experiments \
 tensat:1.0 bash
