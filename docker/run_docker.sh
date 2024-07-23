@@ -1,5 +1,5 @@
 docker run --gpus all --pid=host --net=host \
---name tensat_eps_mcts \
+--name tensat_eqs_mcts \
 -it \
 --mount type=bind,source="/home/user/tensor-eqs-mcts/tensat",target=/usr/tensat \
 --mount type=bind,source="/home/user/tensor-eqs-mcts/egg",target=/usr/egg \
